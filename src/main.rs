@@ -1,5 +1,7 @@
+mod crawler;
 mod initializer;
 
+use crate::crawler::crawl_network;
 use crate::initializer::{Initializer, ROUTER};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
@@ -16,21 +18,27 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 
-#[derive(ValueEnum, Clone, Debug)]
+#[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum RequestType {
     Version,
     Addresses,
+    Crawl,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone, Debug)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
+    #[arg(value_enum, help = "Request type (version, addresses, crawl)")]
+    pub request: RequestType,
+
     #[clap(
         short = 's',
         long,
         default_value = "localhost:18111",
         help = "The ip:port of a spectred instance"
     )]
-    url: String,
+    pub url: String,
+
     #[clap(
         short,
         long,
@@ -38,8 +46,14 @@ struct Cli {
         help = "The network type and suffix, e.g. 'testnet-11'"
     )]
     pub network: String,
-    #[clap(value_enum, help = "Request type")]
-    pub request: RequestType,
+
+    #[clap(
+        short = 'o',
+        long,
+        default_value = "nodes.json",
+        help = "Output JSON file (for crawl mode)"
+    )]
+    pub output: String,
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize)]
@@ -65,6 +79,13 @@ struct NetAddress {
 async fn main() {
     let cli_args = Arc::new(Cli::parse());
 
+    if cli_args.request == RequestType::Crawl {
+        println!("Starting network crawl...");
+        crawl_network(cli_args.clone()).await;
+        println!("Crawl complete. Data saved to {}", cli_args.output);
+        return;
+    }
+
     let (sender, mut receiver) = mpsc::channel(10);
     let initializer = Arc::new(Initializer::new(cli_args.clone(), sender));
     let adaptor =
@@ -82,6 +103,7 @@ async fn main() {
     match cli_args.request {
         RequestType::Version => req_version(&mut receiver).await,
         RequestType::Addresses => req_addresses(&mut receiver, router).await,
+        RequestType::Crawl => {}
     }
     adaptor.terminate_all_peers().await;
 }

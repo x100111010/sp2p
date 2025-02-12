@@ -18,11 +18,13 @@ Usage: sp2p [OPTIONS] <REQUEST>
 Arguments:
   <REQUEST>  Request type [possible values:
     * version: Retrieves the version of the Spectre node
-    * addresses: Retrieves a list of addresses from the Spectre node]
+    * addresses: Retrieves a list of addresses from the Spectre node
+    * crawl: Initiates a network crawl starting from the specified node]
 
 Options:
   -s, --url <URL>          The ip:port of a spectred instance [default: localhost:18111]
   -n, --network <NETWORK>  The network type and suffix, e.g. 'testnet-11' [default: mainnet]
+  -o, --output <OUTPUT>    Output JSON file for crawl mode [default: nodes.json]
 ```
 
 ## Examples
