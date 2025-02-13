@@ -23,7 +23,7 @@ struct NetAddress {
     port: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct NodeData {
     ip: String,
     metadata: NodeMetadata,
@@ -55,61 +55,60 @@ pub async fn crawl_network(cli_args: Arc<Cli>) {
         let batch = {
             let mut queue_lock = queue.lock().await;
             // drain all nodes currently in queue
-            let batch: Vec<String> = queue_lock.drain(..).collect();
-            batch
+            queue_lock.drain(..).collect::<Vec<String>>()
         };
 
         println!("Processing {} nodes in parallel...", batch.len());
-        let mut tasks = Vec::new();
-
         // async task for each node in the batch
-        for url in batch {
-            let cli_args = cli_args.clone();
-            let discovered_peers = Arc::clone(&discovered_peers);
-            let results = Arc::clone(&results);
-            let queue = Arc::clone(&queue);
+        let tasks = batch
+            .into_iter()
+            .map(|url| {
+                let cli_args = cli_args.clone();
+                let discovered_peers = Arc::clone(&discovered_peers);
+                let results = Arc::clone(&results);
+                let queue = Arc::clone(&queue);
 
-            tasks.push(task::spawn(async move {
-                println!("Querying node: {}", url);
-                // each task queries a single node and processes the response
-                match query_node(cli_args.clone(), &url).await {
-                    Ok((url, peers, Some(metadata))) => {
-                        println!(
-                            "Node {} successfully handshaken and returned {} peer(s)",
-                            url,
-                            peers.len()
-                        );
-                        // save handshake
-                        {
-                            let mut results_lock = results.lock().await;
-                            results_lock.push(NodeData {
-                                ip: url.clone(),
-                                metadata,
-                            });
-                        }
-                        // process discovered peers from current node
-                        let mut discovered_lock = discovered_peers.lock().await;
-                        let mut queue_lock = queue.lock().await;
-                        for peer in peers {
-                            // only add new peers to avoid duplicate processing
-                            if discovered_lock.contains(&peer) {
-                                continue;
+                task::spawn(async move {
+                    println!("Querying node: {}", url);
+                    // each task queries a single node and processes the response
+                    match query_node(cli_args.clone(), &url).await {
+                        Ok((url, peers, Some(metadata))) => {
+                            println!(
+                                "Node {} successfully handshaken and returned {} peer(s)",
+                                url,
+                                peers.len()
+                            );
+                            {
+                                let mut results_lock = results.lock().await;
+                                results_lock.push(NodeData {
+                                    ip: url.clone(),
+                                    metadata,
+                                });
                             }
-                            discovered_lock.insert(peer.clone());
-                            let peer_addr = format!("{}:{}", peer.ip, peer.port);
-                            queue_lock.push_back(peer_addr.clone());
-                            println!("Discovered new peer: {}", peer_addr);
+                            // process discovered peers from current node
+                            let mut discovered_lock = discovered_peers.lock().await;
+                            let mut queue_lock = queue.lock().await;
+                            for peer in peers {
+                                // only add new peers to avoid duplicate processing
+                                if discovered_lock.contains(&peer) {
+                                    continue;
+                                }
+                                discovered_lock.insert(peer.clone());
+                                let peer_addr = format!("{}:{}", peer.ip, peer.port);
+                                queue_lock.push_back(peer_addr.clone());
+                                println!("Discovered new peer: {}", peer_addr);
+                            }
+                        }
+                        Ok((url, _, None)) => {
+                            println!("Skipping node {} because handshake failed", url);
+                        }
+                        Err(_) => {
+                            println!("Failed to query node: {}", url);
                         }
                     }
-                    Ok((url, _, None)) => {
-                        println!("Skipping node {} because handshake failed", url);
-                    }
-                    Err(_) => {
-                        println!("Failed to query node: {}", url);
-                    }
-                }
-            }));
-        }
+                })
+            })
+            .collect::<Vec<_>>();
 
         // If no tasks were spawned, there are no new nodes to query
         if tasks.is_empty() {
@@ -128,9 +127,11 @@ pub async fn crawl_network(cli_args: Arc<Cli>) {
     println!("Finalizing results...");
     // serialize collected results to JSON
     let results_guard = results.lock().await;
-    let json_data =
-        serde_json::to_string_pretty(&*results_guard).expect("Failed to serialize results to JSON");
+    let nodes = (*results_guard).clone();
     drop(results_guard);
+
+    let json_data =
+        serde_json::to_string_pretty(&nodes).expect("Failed to serialize results to JSON");
 
     if let Err(e) = fs::write(Path::new(&cli_args.output), json_data).await {
         eprintln!("Error writing JSON file: {}", e);
@@ -211,7 +212,7 @@ async fn query_node(
                             });
                         }
                     }
-                    println!("Received {} address(es) from {}", addresses.len(), url);
+                    println!("Received {} addresses from {}", addresses.len(), url);
                 }
                 Some(Payload::Version(version_msg)) => {
                     metadata = Some(NodeMetadata {
