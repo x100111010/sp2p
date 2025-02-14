@@ -1,6 +1,7 @@
 use crate::initializer::{Initializer, ROUTER};
 use crate::Cli;
 use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use spectre_p2p_lib::pb::spectred_message::Payload;
 use spectre_p2p_lib::pb::RequestAddressesMessage;
@@ -27,6 +28,8 @@ struct NetAddress {
 struct NodeData {
     ip: String,
     metadata: NodeMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loc: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -83,6 +86,7 @@ pub async fn crawl_network(cli_args: Arc<Cli>) {
                                 results_lock.push(NodeData {
                                     ip: url.clone(),
                                     metadata,
+                                    loc: None,
                                 });
                             }
                             // process discovered peers from current node
@@ -130,8 +134,11 @@ pub async fn crawl_network(cli_args: Arc<Cli>) {
     let nodes = (*results_guard).clone();
     drop(results_guard);
 
-    let json_data =
-        serde_json::to_string_pretty(&nodes).expect("Failed to serialize results to JSON");
+    println!("Appending geolocation data...");
+    let geolocated_nodes = append_geolocation_data(nodes, cli_args.clone()).await;
+
+    let json_data = serde_json::to_string_pretty(&geolocated_nodes)
+        .expect("Failed to serialize results to JSON");
 
     if let Err(e) = fs::write(Path::new(&cli_args.output), json_data).await {
         eprintln!("Error writing JSON file: {}", e);
@@ -245,4 +252,74 @@ async fn query_node(
     } else {
         Err(())
     }
+}
+
+/// chunks of 45 and wait 60 seconds between batches (rate limit)
+async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -> Vec<NodeData> {
+    println!("Total nodes to geolocate: {}", data.len());
+    let mut geolocated_nodes = Vec::new();
+
+    for (batch_index, chunk) in data.chunks(45).enumerate() {
+        println!(
+            "\n--- Starting geolocation batch {} (processing {} nodes) ---",
+            batch_index + 1,
+            chunk.len()
+        );
+
+        let tasks: FuturesUnordered<_> = chunk
+            .iter()
+            .map(|node| {
+                let ip = node.ip.split(':').next().unwrap_or(&node.ip).to_string();
+                let url = format!("http://ip-api.com/json/{}?fields=lat,lon,status", ip);
+                let mut updated_node = node.clone();
+
+                async move {
+                    println!("Geolocating node: {}", updated_node.ip);
+
+                    match reqwest::get(&url).await {
+                        Ok(response) => match response.json::<serde_json::Value>().await {
+                            Ok(json) if json["status"] == "success" => {
+                                if let (Some(lat), Some(lon)) =
+                                    (json["lat"].as_f64(), json["lon"].as_f64())
+                                {
+                                    updated_node.loc = Some(format!("{},{}", lat, lon));
+                                }
+                            }
+                            Ok(json) => {
+                                eprintln!(
+                                    "Geolocation lookup failed for {}: status = {}",
+                                    updated_node.ip, json["status"]
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Failed to parse JSON response for {}: {}",
+                                    updated_node.ip, e
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("HTTP request failed for {}: {}", updated_node.ip, e);
+                        }
+                    }
+
+                    println!("Completed geolocation for node: {}", updated_node.ip);
+                    updated_node
+                }
+            })
+            .collect();
+
+        let mut tasks = tasks;
+        while let Some(node) = tasks.next().await {
+            geolocated_nodes.push(node);
+        }
+
+        println!(
+            "--- Batch {} complete. Waiting 60 seconds. ---",
+            batch_index + 1
+        );
+        sleep(Duration::from_secs(60)).await;
+    }
+
+    geolocated_nodes
 }
