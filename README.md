@@ -33,3 +33,7 @@ Options:
 - Query the addresses of a Spectre node on a test network: `sp2p -n testnet-11 addresses`
 - Query a Spectre node at a custom IP and port: `sp2p -s 127.0.0.1:18111 version`
 - Start the network crawler and serve the node data: `cargo run -- crawl --api-port 3000`
+
+### Thank You
+A thank you to suprtypo@pm.me for the [original work](https://github.com/supertypo/kp2p). 
+It provided the general approach used here, as well as the initial codebase.
