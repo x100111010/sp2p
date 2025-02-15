@@ -1,22 +1,30 @@
 mod crawler;
 mod initializer;
+mod models;
 
-use crate::crawler::crawl_network;
+use crate::crawler::{append_geolocation_data, crawl_network};
 use crate::initializer::{Initializer, ROUTER};
+use crate::models::NodeData;
+use axum::http::{HeaderName, Method};
+use axum::{extract::State, routing::get, Json, Router as AxumRouter};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use spectre_p2p_lib::pb::spectred_message::Payload;
 use spectre_p2p_lib::pb::{RequestAddressesMessage, SpectredMessage};
-use spectre_p2p_lib::{make_message, Hub, Router};
+use spectre_p2p_lib::{make_message, Hub, Router as SpectreRouter};
 use spectre_utils::hex::ToHex;
 use spectre_utils::networking::IpAddress;
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(ValueEnum, Clone, Debug, PartialEq)]
 enum RequestType {
@@ -54,6 +62,13 @@ struct Cli {
         help = "Output JSON file (for crawl mode)"
     )]
     pub output: String,
+
+    #[clap(
+        long,
+        help = "Port to serve the JSON API on (for crawl mode)",
+        default_value = "3000"
+    )]
+    pub api_port: u16,
 }
 
 #[derive(Eq, PartialEq, Hash, Serialize)]
@@ -75,13 +90,78 @@ struct NetAddress {
     port: u16,
 }
 
+struct AppState {
+    nodes: Arc<Mutex<Vec<NodeData>>>,
+}
+
+async fn get_nodes(State(state): State<Arc<AppState>>) -> Json<Vec<NodeData>> {
+    let nodes = state.nodes.lock().await;
+    Json(nodes.clone())
+}
+
+/// update every 24 hours
+async fn update_nodes_periodically(state: Arc<AppState>, cli_args: Arc<Cli>) {
+    loop {
+        println!("Updating node data...");
+
+        let new_nodes = crawl_network(cli_args.clone()).await;
+        let geolocated_nodes = append_geolocation_data(new_nodes, cli_args.clone()).await;
+
+        {
+            let mut nodes = state.nodes.lock().await;
+            *nodes = geolocated_nodes;
+        }
+
+        println!("Node data updated. Waiting 24 hours for the next update...");
+        sleep(Duration::from_secs(24 * 60 * 60)).await; // Wait
+    }
+}
+
+async fn start_server(state: Arc<AppState>, port: u16) {
+    // configure CORS
+    let cors = CorsLayer::new()
+        .allow_methods(vec![Method::GET])
+        .allow_origin(AllowOrigin::any())
+        .allow_headers(vec![
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("access-control-allow-origin"),
+        ])
+        .expose_headers(vec![HeaderName::from_static("content-type")]);
+
+    let app = AxumRouter::new()
+        .route("/nodes", get(get_nodes))
+        .layer(cors)
+        .with_state(state);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    println!("Server running at http://{}", addr);
+
+    let listener = TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
 #[tokio::main]
 async fn main() {
     let cli_args = Arc::new(Cli::parse());
 
     if cli_args.request == RequestType::Crawl {
         println!("Starting network crawl...");
-        crawl_network(cli_args.clone()).await;
+
+        let initial_nodes = Vec::new(); // start with an empty list
+        let state = Arc::new(AppState {
+            nodes: Arc::new(Mutex::new(initial_nodes)),
+        });
+
+        // background task
+        let state_clone = Arc::clone(&state);
+        let cli_args_clone = Arc::clone(&cli_args);
+        tokio::spawn(async move {
+            update_nodes_periodically(state_clone, cli_args_clone).await;
+        });
+
+        // HTTP server
+        start_server(state, cli_args.api_port).await;
+
         println!("Crawl complete. Data saved to {}", cli_args.output);
         return;
     }
@@ -136,7 +216,7 @@ async fn req_version(receiver: &mut Receiver<SpectredMessage>) {
     }
 }
 
-async fn req_addresses(receiver: &mut Receiver<SpectredMessage>, router: Arc<Router>) {
+async fn req_addresses(receiver: &mut Receiver<SpectredMessage>, router: Arc<SpectreRouter>) {
     let _ = router
         .enqueue(make_message!(
             Payload::RequestAddresses,

@@ -32,3 +32,4 @@ Options:
 - Query the version of a Spectre node on the default network: `sp2p version`
 - Query the addresses of a Spectre node on a test network: `sp2p -n testnet-11 addresses`
 - Query a Spectre node at a custom IP and port: `sp2p -s 127.0.0.1:18111 version`
+- Start the network crawler and serve the node data: `cargo run -- crawl --api-port 3000`

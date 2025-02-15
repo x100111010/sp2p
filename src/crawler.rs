@@ -1,8 +1,9 @@
 use crate::initializer::{Initializer, ROUTER};
+use crate::models::{NodeData, NodeMetadata};
 use crate::Cli;
 use futures::future::join_all;
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
+use serde_json::Value;
 use spectre_p2p_lib::pb::spectred_message::Payload;
 use spectre_p2p_lib::pb::RequestAddressesMessage;
 use spectre_p2p_lib::{make_message, Hub};
@@ -10,41 +11,20 @@ use spectre_utils::hex::ToHex;
 use spectre_utils::networking::IpAddress;
 use std::collections::{HashSet, VecDeque};
 use std::net::IpAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task;
 use tokio::time::{sleep, timeout};
 
 #[derive(Eq, PartialEq, Hash, Serialize, Clone)]
-struct NetAddress {
+pub struct NetAddress {
     ip: IpAddr,
     port: u16,
 }
 
-#[derive(Serialize, Clone)]
-struct NodeData {
-    ip: String,
-    metadata: NodeMetadata,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    loc: Option<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct NodeMetadata {
-    protocol_version: u32,
-    network: String,
-    services: u64,
-    timestamp: String,
-    id: String,
-    user_agent: String,
-    disable_relay_tx: bool,
-}
-
 /// crawl from the node provided in cli_args.url
-pub async fn crawl_network(cli_args: Arc<Cli>) {
+pub async fn crawl_network(cli_args: Arc<Cli>) -> Vec<NodeData> {
     let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
     let results = Arc::new(Mutex::new(Vec::new()));
     let queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -134,15 +114,7 @@ pub async fn crawl_network(cli_args: Arc<Cli>) {
     let nodes = (*results_guard).clone();
     drop(results_guard);
 
-    println!("Appending geolocation data...");
-    let geolocated_nodes = append_geolocation_data(nodes, cli_args.clone()).await;
-
-    let json_data = serde_json::to_string_pretty(&geolocated_nodes)
-        .expect("Failed to serialize results to JSON");
-
-    if let Err(e) = fs::write(Path::new(&cli_args.output), json_data).await {
-        eprintln!("Error writing JSON file: {}", e);
-    }
+    append_geolocation_data(nodes, cli_args.clone()).await
 }
 
 /// Query a single node at the given URL and return its discovered addresses and handshake metadata
@@ -254,71 +226,64 @@ async fn query_node(
     }
 }
 
-/// chunks of 45 and wait 60 seconds between batches (rate limit)
-async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -> Vec<NodeData> {
+pub async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -> Vec<NodeData> {
     println!("Total nodes to geolocate: {}", data.len());
     let mut geolocated_nodes = Vec::new();
 
-    for (batch_index, chunk) in data.chunks(45).enumerate() {
-        println!(
-            "\n--- Starting geolocation batch {} (processing {} nodes) ---",
-            batch_index + 1,
-            chunk.len()
-        );
+    for node in data {
+        let ip = node.ip.split(':').next().unwrap_or(&node.ip).to_string();
+        let url = format!("http://ip-api.com/json/{}?fields=lat,lon,status", ip);
+        let mut updated_node = node.clone();
 
-        let tasks: FuturesUnordered<_> = chunk
-            .iter()
-            .map(|node| {
-                let ip = node.ip.split(':').next().unwrap_or(&node.ip).to_string();
-                let url = format!("http://ip-api.com/json/{}?fields=lat,lon,status", ip);
-                let mut updated_node = node.clone();
+        println!("Geolocating node: {}", updated_node.ip);
 
-                async move {
-                    println!("Geolocating node: {}", updated_node.ip);
+        let mut retries = 3;
+        let mut success = false;
 
-                    match reqwest::get(&url).await {
-                        Ok(response) => match response.json::<serde_json::Value>().await {
-                            Ok(json) if json["status"] == "success" => {
-                                if let (Some(lat), Some(lon)) =
-                                    (json["lat"].as_f64(), json["lon"].as_f64())
-                                {
-                                    updated_node.loc = Some(format!("{},{}", lat, lon));
-                                }
-                            }
-                            Ok(json) => {
-                                eprintln!(
-                                    "Geolocation lookup failed for {}: status = {}",
-                                    updated_node.ip, json["status"]
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Failed to parse JSON response for {}: {}",
-                                    updated_node.ip, e
-                                );
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("HTTP request failed for {}: {}", updated_node.ip, e);
+        while retries > 0 {
+            match reqwest::get(&url).await {
+                Ok(response) => match response.json::<Value>().await {
+                    Ok(json) if json["status"] == "success" => {
+                        if let (Some(lat), Some(lon)) = (json["lat"].as_f64(), json["lon"].as_f64())
+                        {
+                            updated_node.loc = Some(format!("{},{}", lat, lon));
+                            success = true;
+                            break;
                         }
                     }
-
-                    println!("Completed geolocation for node: {}", updated_node.ip);
-                    updated_node
+                    Ok(json) => {
+                        eprintln!(
+                            "Geolocation lookup failed for {}: status = {}",
+                            updated_node.ip, json["status"]
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to parse JSON response for {}: {}",
+                            updated_node.ip, e
+                        );
+                    }
+                },
+                Err(e) => {
+                    eprintln!("HTTP request failed for {}: {}", updated_node.ip, e);
                 }
-            })
-            .collect();
+            }
 
-        let mut tasks = tasks;
-        while let Some(node) = tasks.next().await {
-            geolocated_nodes.push(node);
+            retries -= 1;
+            if retries > 0 {
+                println!("Retrying in 1 second... ({} retries left)", retries);
+                sleep(Duration::from_secs(1)).await;
+            }
         }
 
-        println!(
-            "--- Batch {} complete. Waiting 60 seconds. ---",
-            batch_index + 1
-        );
-        sleep(Duration::from_secs(60)).await;
+        if !success {
+            eprintln!("Failed to geolocate node: {}", updated_node.ip);
+        }
+
+        geolocated_nodes.push(updated_node);
+
+        // 2s pause between requests to respect rate limits
+        sleep(Duration::from_secs(1)).await;
     }
 
     geolocated_nodes
