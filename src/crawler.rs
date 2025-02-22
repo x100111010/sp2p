@@ -14,7 +14,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tokio::task;
 use tokio::time::{sleep, timeout};
 
 #[derive(Eq, PartialEq, Hash, Serialize, Clone)]
@@ -29,20 +28,17 @@ pub async fn crawl_network(cli_args: Arc<Cli>) -> Vec<NodeData> {
     let results = Arc::new(Mutex::new(Vec::new()));
     let queue = Arc::new(Mutex::new(VecDeque::new()));
 
-    println!("Starting network crawl from {}", cli_args.url);
+    println!("Starting crawl from: {}", cli_args.url);
     queue.lock().await.push_back(cli_args.url.clone());
 
-    // continue until there are no more nodes in the queue
     while !queue.lock().await.is_empty() {
         // drain current queue into a batch for concurrent processing
         let batch = {
             let mut queue_lock = queue.lock().await;
-            // drain all nodes currently in queue
             queue_lock.drain(..).collect::<Vec<String>>()
         };
 
-        println!("Processing {} nodes in parallel...", batch.len());
-        // async task for each node in the batch
+        println!("Batch size: {}", batch.len());
         let tasks = batch
             .into_iter()
             .map(|url| {
@@ -51,44 +47,30 @@ pub async fn crawl_network(cli_args: Arc<Cli>) -> Vec<NodeData> {
                 let results = Arc::clone(&results);
                 let queue = Arc::clone(&queue);
 
-                task::spawn(async move {
-                    println!("Querying node: {}", url);
-                    // each task queries a single node and processes the response
-                    match query_node(cli_args.clone(), &url).await {
+                tokio::spawn(async move {
+                    println!("Querying: {}", url);
+                    match connect_and_query_peer(cli_args, &url).await {
                         Ok((url, peers, Some(metadata))) => {
-                            println!(
-                                "Node {} successfully handshaken and returned {} peer(s)",
-                                url,
-                                peers.len()
-                            );
-                            {
-                                let mut results_lock = results.lock().await;
-                                results_lock.push(NodeData {
-                                    ip: url.clone(),
-                                    metadata,
-                                    loc: None,
-                                });
-                            }
-                            // process discovered peers from current node
+                            println!("{}: Handshake OK, {} peers", url, peers.len());
+                            results.lock().await.push(NodeData {
+                                ip: url.clone(),
+                                metadata,
+                                loc: None,
+                            });
+
                             let mut discovered_lock = discovered_peers.lock().await;
                             let mut queue_lock = queue.lock().await;
                             for peer in peers {
-                                // only add new peers to avoid duplicate processing
-                                if discovered_lock.contains(&peer) {
-                                    continue;
+                                if !discovered_lock.contains(&peer) {
+                                    discovered_lock.insert(peer.clone());
+                                    let peer_addr = format!("{}:{}", peer.ip, peer.port);
+                                    queue_lock.push_back(peer_addr.clone());
+                                    println!("New peer: {}", peer_addr);
                                 }
-                                discovered_lock.insert(peer.clone());
-                                let peer_addr = format!("{}:{}", peer.ip, peer.port);
-                                queue_lock.push_back(peer_addr.clone());
-                                println!("Discovered new peer: {}", peer_addr);
                             }
                         }
-                        Ok((url, _, None)) => {
-                            println!("Skipping node {} because handshake failed", url);
-                        }
-                        Err(_) => {
-                            println!("Failed to query node: {}", url);
-                        }
+                        Ok((url, _, None)) => println!("{}: Handshake failed", url),
+                        Err(_) => println!("{}: Query failed", url),
                     }
                 })
             })
@@ -96,16 +78,16 @@ pub async fn crawl_network(cli_args: Arc<Cli>) -> Vec<NodeData> {
 
         // If no tasks were spawned, there are no new nodes to query
         if tasks.is_empty() {
-            println!("No new nodes to query, exiting...");
+            println!("No new peers to query, exiting...");
             break;
         } else {
-            println!("Awaiting {} concurrent node queries...", tasks.len());
+            println!("Awaiting {} queries", tasks.len());
         }
 
         // Await all tasks concurrently using join_all
         // This is the batch processing step: all node queries in the current batch run in parallel
         join_all(tasks).await;
-        println!("Completed batch, checking queue for next nodes...");
+        println!("Batch complete, checking queue");
     }
 
     println!("Finalizing results...");
@@ -114,12 +96,12 @@ pub async fn crawl_network(cli_args: Arc<Cli>) -> Vec<NodeData> {
     let nodes = (*results_guard).clone();
     drop(results_guard);
 
-    append_geolocation_data(nodes, cli_args.clone()).await
+    add_geolocation(nodes, cli_args.clone()).await
 }
 
 /// Query a single node at the given URL and return its discovered addresses and handshake metadata
 /// returns error if handshake fails
-async fn query_node(
+async fn connect_and_query_peer(
     cli_args: Arc<Cli>,
     url: &str,
 ) -> Result<(String, Vec<NetAddress>, Option<NodeMetadata>), ()> {
@@ -131,23 +113,10 @@ async fn query_node(
     let adaptor =
         spectre_p2p_lib::Adaptor::client_only(Hub::new(), initializer, Default::default());
 
-    // attempt connecting up to 3 times
-    for attempt in 1..=3 {
-        if adaptor
-            .connect_peer_with_retries(url.to_string(), 3, Duration::from_secs(1))
-            .await
-            .is_err()
-        {
-            println!("Connection attempt {}/3 failed: {}", attempt, url);
-            if attempt == 3 {
-                println!("Skipping node {} after 3 failed attempts", url);
-                adaptor.terminate_all_peers().await;
-                return Err(());
-            }
-            sleep(Duration::from_secs(1)).await;
-        } else {
-            break;
-        }
+    if adaptor.connect_peer(url.to_string()).await.is_err() {
+        println!("Peer {}: connection failed", url);
+        adaptor.terminate_all_peers().await;
+        return Err(());
     }
 
     // Retrieve shared router from global state
@@ -158,7 +127,7 @@ async fn query_node(
     let router = if let Some(router) = router {
         router
     } else {
-        println!("Router is not initialized, skipping node: {}", url);
+        println!("Peer {}: router not initialized, skipping", url);
         adaptor.terminate_all_peers().await;
         return Err(());
     };
@@ -191,7 +160,7 @@ async fn query_node(
                             });
                         }
                     }
-                    println!("Received {} addresses from {}", addresses.len(), url);
+                    println!("Peer {}: received {} addresses", url, addresses.len());
                 }
                 Some(Payload::Version(version_msg)) => {
                     metadata = Some(NodeMetadata {
@@ -203,19 +172,19 @@ async fn query_node(
                         user_agent: version_msg.user_agent,
                         disable_relay_tx: version_msg.disable_relay_tx,
                     });
-                    println!("Received metadata from {}", url);
+                    println!("Peer {}: received metadata", url);
                 }
                 _ => {}
             },
             Ok(None) => break,
             Err(_) => {
-                println!("Timeout reached while waiting for messages from {}", url);
+                println!("Peer {}: timeout waiting for messages", url);
                 break;
             }
         }
     }
 
-    println!("Disconnected from {}", url);
+    println!("Peer {}: disconnected", url);
     adaptor.terminate_all_peers().await;
 
     // only return nodes that completed handshake successfully
@@ -226,8 +195,8 @@ async fn query_node(
     }
 }
 
-pub async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -> Vec<NodeData> {
-    println!("Total nodes to geolocate: {}", data.len());
+pub async fn add_geolocation(data: Vec<NodeData>, _cli_args: Arc<Cli>) -> Vec<NodeData> {
+    println!("Total to geolocate: {}", data.len());
     let mut geolocated_nodes = Vec::new();
 
     for node in data {
@@ -235,7 +204,7 @@ pub async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -
         let url = format!("http://ip-api.com/json/{}?fields=lat,lon,status", ip);
         let mut updated_node = node.clone();
 
-        println!("Geolocating node: {}", updated_node.ip);
+        println!("Geolocating: {}", updated_node.ip);
 
         let mut retries = 3;
         let mut success = false;
@@ -253,36 +222,36 @@ pub async fn append_geolocation_data(data: Vec<NodeData>, _cli_args: Arc<Cli>) -
                     }
                     Ok(json) => {
                         eprintln!(
-                            "Geolocation lookup failed for {}: status = {}",
+                            "Peer {}: geolocation failed, status: {}",
                             updated_node.ip, json["status"]
                         );
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Failed to parse JSON response for {}: {}",
-                            updated_node.ip, e
-                        );
+                        eprintln!("Peer {}: JSON parse error: {}", updated_node.ip, e);
                     }
                 },
                 Err(e) => {
-                    eprintln!("HTTP request failed for {}: {}", updated_node.ip, e);
+                    eprintln!("Peer {}: HTTP error: {}", updated_node.ip, e);
                 }
             }
 
             retries -= 1;
             if retries > 0 {
-                println!("Retrying in 1 second... ({} retries left)", retries);
+                println!(
+                    "Peer {}: retrying in 1s ({} left)",
+                    updated_node.ip, retries
+                );
                 sleep(Duration::from_secs(1)).await;
             }
         }
 
         if !success {
-            eprintln!("Failed to geolocate node: {}", updated_node.ip);
+            eprintln!("Peer {}: geolocation failed", updated_node.ip);
         }
 
         geolocated_nodes.push(updated_node);
 
-        // 2s pause between requests to respect rate limits
+        // 1s pause to respect rate limits
         sleep(Duration::from_secs(1)).await;
     }
 

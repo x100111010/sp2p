@@ -2,7 +2,7 @@ mod crawler;
 mod initializer;
 mod models;
 
-use crate::crawler::{append_geolocation_data, crawl_network};
+use crate::crawler::{add_geolocation, crawl_network};
 use crate::initializer::{Initializer, ROUTER};
 use crate::models::NodeData;
 use axum::http::{HeaderName, Method};
@@ -105,7 +105,7 @@ async fn update_nodes_periodically(state: Arc<AppState>, cli_args: Arc<Cli>) {
         println!("Updating node data...");
 
         let new_nodes = crawl_network(cli_args.clone()).await;
-        let geolocated_nodes = append_geolocation_data(new_nodes, cli_args.clone()).await;
+        let geolocated_nodes = add_geolocation(new_nodes, cli_args.clone()).await;
 
         {
             let mut nodes = state.nodes.lock().await;
